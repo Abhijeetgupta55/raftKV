@@ -54,6 +54,20 @@ func (s *MemStore) Delete(key string) (existed bool) {
 	return ok
 }
 
+// Range calls fn for every key/value pair until fn returns false, holding
+// the read lock throughout. The value slice is the store's internal data:
+// fn must not mutate or retain it. Used by snapshotting, which only
+// streams the bytes to disk.
+func (s *MemStore) Range(fn func(key string, value []byte) bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for k, v := range s.data {
+		if !fn(k, v) {
+			return
+		}
+	}
+}
+
 // Len returns the number of stored keys.
 func (s *MemStore) Len() int {
 	s.mu.RLock()
