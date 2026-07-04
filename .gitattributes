@@ -1,0 +1,3 @@
+# Normalize to LF in the repository so gofmt output and CI checks are
+# identical across Windows, macOS, and Linux checkouts.
+* text=auto eol=lf
