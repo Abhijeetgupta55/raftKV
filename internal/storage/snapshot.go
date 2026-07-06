@@ -4,13 +4,14 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/Abhijeetgupta55/raftkv/internal/record"
 )
 
 // A snapshot is a full dump of the state machine, named %020d.snap after
@@ -55,7 +56,7 @@ func writeSnapshot(dir string, lastSeq uint64, mem *MemStore) (err error) {
 		}
 	}()
 
-	crc := crc32.New(castagnoli)
+	crc := record.NewHash()
 	bw := bufio.NewWriter(f)
 	w := io.MultiWriter(bw, crc) // every byte written also feeds the checksum
 
@@ -114,7 +115,7 @@ func writeSnapshot(dir string, lastSeq uint64, mem *MemStore) (err error) {
 	if err = os.Rename(tmp, final); err != nil {
 		return err
 	}
-	return syncDir(dir)
+	return record.SyncDir(dir)
 }
 
 // loadNewestSnapshot restores the most recent snapshot in dir, returning
@@ -168,7 +169,7 @@ func readSnapshot(path string) (*MemStore, uint64, error) {
 	}
 
 	body, tail := data[:len(data)-4], data[len(data)-4:]
-	if crc32.Checksum(body, castagnoli) != binary.LittleEndian.Uint32(tail) {
+	if record.Checksum(body) != binary.LittleEndian.Uint32(tail) {
 		return nil, 0, fmt.Errorf("snapshot %s: checksum mismatch — disk corruption", path)
 	}
 	if string(body[:len(snapMagic)]) != snapMagic {

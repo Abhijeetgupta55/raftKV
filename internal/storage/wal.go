@@ -4,13 +4,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/Abhijeetgupta55/raftkv/internal/record"
 )
 
 // The write-ahead log is a directory of segment files, each a flat
@@ -38,7 +38,7 @@ import (
 
 const (
 	walExt          = ".wal"
-	walHeaderSize   = 8 // uint32 payloadLen + uint32 crc
+	walHeaderSize   = record.HeaderSize
 	walSeqSize      = 8 // uint64 seq at the start of each payload
 	walMaxRecordLen = walSeqSize + 1 + 4 + MaxKeyBytesOnDisk + 4 + MaxValueBytesOnDisk
 )
@@ -52,19 +52,18 @@ const (
 	MaxValueBytesOnDisk = 1 << 26 // 64 MiB
 )
 
-var castagnoli = crc32.MakeTable(crc32.Castagnoli)
-
 // errWALFailed is returned by Append after any write or sync error: the
 // file's on-disk state is unknown at that point, so the WAL refuses all
 // further appends rather than risk writing records after a torn one.
 var errWALFailed = errors.New("wal: failed by an earlier write error; storage is read-only")
 
 type wal struct {
-	dir    string
-	f      *os.File
-	size   int64 // bytes in the active segment
-	buf    []byte
-	failed bool
+	dir        string
+	f          *os.File
+	size       int64 // bytes in the active segment
+	payloadBuf []byte
+	frameBuf   []byte
+	failed     bool
 }
 
 // segmentPath returns the path of the segment whose first sequence
@@ -79,7 +78,7 @@ func createWAL(dir string, startSeq uint64) (*wal, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := record.SyncDir(dir); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -105,14 +104,13 @@ func (w *wal) Append(seq uint64, command []byte) error {
 		return errWALFailed
 	}
 
-	payloadLen := walSeqSize + len(command)
-	b := w.buf[:0]
-	b = binary.LittleEndian.AppendUint32(b, uint32(payloadLen))
-	b = append(b, 0, 0, 0, 0) // CRC placeholder, filled below
-	b = binary.LittleEndian.AppendUint64(b, seq)
-	b = append(b, command...)
-	binary.LittleEndian.PutUint32(b[4:8], crc32.Checksum(b[walHeaderSize:], castagnoli))
-	w.buf = b
+	p := w.payloadBuf[:0]
+	p = binary.LittleEndian.AppendUint64(p, seq)
+	p = append(p, command...)
+	w.payloadBuf = p
+
+	b := record.Frame(w.frameBuf[:0], p)
+	w.frameBuf = b
 
 	if _, err := w.f.Write(b); err != nil {
 		w.failed = true
@@ -230,40 +228,12 @@ type walRecord struct {
 // decides whether that means "torn tail" or "corruption" based on which
 // segment it is in.
 func parseRecord(b []byte) (rec walRecord, recLen int64, ok bool) {
-	if len(b) < walHeaderSize {
-		return walRecord{}, 0, false
-	}
-	payloadLen := binary.LittleEndian.Uint32(b)
-	crc := binary.LittleEndian.Uint32(b[4:])
-	if payloadLen < walSeqSize || payloadLen > walMaxRecordLen {
-		return walRecord{}, 0, false
-	}
-	end := walHeaderSize + int(payloadLen)
-	if len(b) < end {
-		return walRecord{}, 0, false
-	}
-	payload := b[walHeaderSize:end]
-	if crc32.Checksum(payload, castagnoli) != crc {
+	payload, recLen, ok := record.Parse(b, walMaxRecordLen)
+	if !ok || len(payload) < walSeqSize {
 		return walRecord{}, 0, false
 	}
 	return walRecord{
 		seq:     binary.LittleEndian.Uint64(payload),
 		command: payload[walSeqSize:],
-	}, int64(end), true
-}
-
-// syncDir fsyncs a directory so that file creations and renames inside it
-// are themselves durable. Windows does not support syncing directory
-// handles; there the OS metadata journal is relied on instead, which is a
-// documented known limitation rather than a silent one.
-func syncDir(dir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	}, recLen, true
 }
