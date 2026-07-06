@@ -37,7 +37,7 @@ proto:
 	protoc \
 		--go_out=. --go_opt=paths=source_relative \
 		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
-		proto/kv/v1/kv.proto
+		proto/kv/v1/kv.proto proto/raft/v1/raft.proto
 
 run-server: build
 	$(BIN)/kvserver$(EXE)
