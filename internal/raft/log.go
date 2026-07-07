@@ -11,13 +11,23 @@ import (
 	"path/filepath"
 
 	"github.com/Abhijeetgupta55/raftkv/internal/record"
+	raftv1 "github.com/Abhijeetgupta55/raftkv/proto/raft/v1"
 )
 
 // Entry is one slot in the replicated log.
 type Entry struct {
 	Term    uint64
 	Index   uint64
+	Type    raftv1.EntryType
 	Command []byte
+}
+
+func (e Entry) toProto() *raftv1.LogEntry {
+	return &raftv1.LogEntry{Term: e.Term, Index: e.Index, Type: e.Type, Command: e.Command}
+}
+
+func entryFromProto(p *raftv1.LogEntry) Entry {
+	return Entry{Term: p.GetTerm(), Index: p.GetIndex(), Type: p.GetType(), Command: p.GetCommand()}
 }
 
 // The Raft log is a single append-only file of CRC-framed records
@@ -36,7 +46,7 @@ type Entry struct {
 
 const (
 	logFileName    = "log"
-	entryHeaderLen = 16 // uint64 term + uint64 index before the command
+	entryHeaderLen = 17 // uint64 term + uint64 index + uint8 type before the command
 	// Sanity bound for replay: far above the service-layer 1 MiB value
 	// limit, small enough to reject absurd lengths from a corrupt header.
 	maxEntryPayload = entryHeaderLen + (64 << 20)
@@ -57,8 +67,10 @@ type logStore struct {
 
 // openLog opens (creating if absent) the Raft log in dir and replays it,
 // returning the surviving entries — contiguous, ascending, conflicts
-// already resolved by the supersede rule.
-func openLog(dir string) (*logStore, []Entry, error) {
+// already resolved by the supersede rule. base is the index the log
+// starts after (the snapshot's last included index; 0 for a fresh node):
+// the first entry must be base+1 or the log lost its head.
+func openLog(dir string, base uint64) (*logStore, []Entry, error) {
 	path := filepath.Join(dir, logFileName)
 
 	data, err := os.ReadFile(path)
@@ -76,15 +88,15 @@ func openLog(dir string) (*logStore, []Entry, error) {
 		e := Entry{
 			Term:    binary.LittleEndian.Uint64(payload),
 			Index:   binary.LittleEndian.Uint64(payload[8:]),
+			Type:    raftv1.EntryType(payload[16]),
 			Command: append([]byte(nil), payload[entryHeaderLen:]...),
 		}
 
 		switch {
 		case len(entries) == 0:
-			// Milestone 3's compaction will allow a later base; until
-			// then a log that doesn't start at 1 lost its head somehow.
-			if e.Index != 1 {
-				return nil, nil, fmt.Errorf("raft: log starts at index %d, want 1", e.Index)
+			if e.Index != base+1 {
+				return nil, nil, fmt.Errorf("raft: log starts at index %d, want %d (snapshot covers through %d)",
+					e.Index, base+1, base)
 			}
 		case e.Index == entries[len(entries)-1].Index+1:
 			// The common case: the log grows.
@@ -143,6 +155,7 @@ func (l *logStore) append(entries ...Entry) error {
 		p := l.payloadBuf[:0]
 		p = binary.LittleEndian.AppendUint64(p, e.Term)
 		p = binary.LittleEndian.AppendUint64(p, e.Index)
+		p = append(p, byte(e.Type))
 		p = append(p, e.Command...)
 		l.payloadBuf = p
 		b = record.Frame(b, p)
@@ -162,4 +175,42 @@ func (l *logStore) append(entries ...Entry) error {
 
 func (l *logStore) close() error {
 	return l.f.Close()
+}
+
+// rewrite atomically replaces the whole log file with exactly the given
+// entries — the compaction path (entries covered by a snapshot are
+// dropped) and the snapshot-installation path (everything is dropped).
+// The file is closed first because Windows cannot rename over an open
+// file; a crash between close and rename leaves the old log intact.
+func (l *logStore) rewrite(entries []Entry) error {
+	if l.failed {
+		return errLogFailed
+	}
+	if err := l.f.Close(); err != nil {
+		l.failed = true
+		return err
+	}
+
+	var buf []byte
+	for _, e := range entries {
+		p := make([]byte, 0, entryHeaderLen+len(e.Command))
+		p = binary.LittleEndian.AppendUint64(p, e.Term)
+		p = binary.LittleEndian.AppendUint64(p, e.Index)
+		p = append(p, byte(e.Type))
+		p = append(p, e.Command...)
+		buf = record.Frame(buf, p)
+	}
+
+	path := filepath.Join(l.dir, logFileName)
+	if err := record.WriteFileAtomic(path, buf); err != nil {
+		l.failed = true
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		l.failed = true
+		return err
+	}
+	l.f = f
+	return nil
 }

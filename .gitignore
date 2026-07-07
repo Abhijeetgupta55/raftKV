@@ -8,3 +8,5 @@
 # Editor/IDE state
 .idea/
 .vscode/
+
+.claude/

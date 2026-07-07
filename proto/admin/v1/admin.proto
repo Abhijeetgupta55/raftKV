@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package admin.v1;
+
+option go_package = "github.com/Abhijeetgupta55/raftkv/proto/admin/v1;adminv1";
+
+// Admin is the operator-facing surface: cluster introspection and
+// membership operations. Separate from kv.v1 (clients) and raft.v1
+// (cluster internals) so each audience sees exactly its own API.
+service Admin {
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+  rpc AddMember(AddMemberRequest) returns (AddMemberResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+  rpc TransferLeadership(TransferLeadershipRequest) returns (TransferLeadershipResponse);
+}
+
+message ClusterStatusRequest {}
+
+message GroupStatus {
+  uint64 group = 1;
+  uint64 term = 2;
+  uint64 leader_id = 3;
+  string role = 4; // this node's role in the group
+  uint64 commit_index = 5;
+  uint64 last_applied = 6;
+  uint64 last_log_index = 7;
+  map<uint64, string> members = 8; // id -> address
+}
+
+message ClusterStatusResponse {
+  uint64 node_id = 1;
+  repeated GroupStatus groups = 2;
+}
+
+// Membership changes apply to every Raft group on the affected node:
+// shards share the same member set (placement is static until
+// rebalancing exists).
+message AddMemberRequest {
+  uint64 id = 1;
+  string address = 2;
+}
+message AddMemberResponse {}
+
+message RemoveMemberRequest {
+  uint64 id = 1;
+}
+message RemoveMemberResponse {}
+
+message TransferLeadershipRequest {
+  uint64 group = 1;
+  uint64 to = 2;
+}
+message TransferLeadershipResponse {}

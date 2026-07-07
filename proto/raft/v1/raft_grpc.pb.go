@@ -19,8 +19,10 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Raft_RequestVote_FullMethodName   = "/raft.v1.Raft/RequestVote"
-	Raft_AppendEntries_FullMethodName = "/raft.v1.Raft/AppendEntries"
+	Raft_RequestVote_FullMethodName     = "/raft.v1.Raft/RequestVote"
+	Raft_AppendEntries_FullMethodName   = "/raft.v1.Raft/AppendEntries"
+	Raft_InstallSnapshot_FullMethodName = "/raft.v1.Raft/InstallSnapshot"
+	Raft_TimeoutNow_FullMethodName      = "/raft.v1.Raft/TimeoutNow"
 )
 
 // RaftClient is the client API for Raft service.
@@ -30,12 +32,19 @@ const (
 // Raft is the node-to-node consensus protocol, deliberately a separate
 // service from the client-facing kv.v1: cluster internals and clients
 // never share a surface. Field semantics follow the Raft paper (Figure 2)
-// exactly; the one extension is the conflict_* fields on
-// AppendEntriesResponse, which let a leader skip whole conflicting terms
-// when repairing a follower's log instead of probing one entry per RPC.
+// exactly; extensions beyond the paper are called out on each field.
+//
+// Every request carries `group`: a node hosts one Raft group per shard,
+// and the group id routes the message to the right instance.
 type RaftClient interface {
 	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
 	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
+	// InstallSnapshot replaces a follower's entire state when the leader
+	// has already compacted the log entries the follower would need.
+	InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error)
+	// TimeoutNow asks the target to start an election immediately,
+	// implementing voluntary leadership transfer.
+	TimeoutNow(ctx context.Context, in *TimeoutNowRequest, opts ...grpc.CallOption) (*TimeoutNowResponse, error)
 }
 
 type raftClient struct {
@@ -66,6 +75,26 @@ func (c *raftClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest
 	return out, nil
 }
 
+func (c *raftClient) InstallSnapshot(ctx context.Context, in *InstallSnapshotRequest, opts ...grpc.CallOption) (*InstallSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InstallSnapshotResponse)
+	err := c.cc.Invoke(ctx, Raft_InstallSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *raftClient) TimeoutNow(ctx context.Context, in *TimeoutNowRequest, opts ...grpc.CallOption) (*TimeoutNowResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TimeoutNowResponse)
+	err := c.cc.Invoke(ctx, Raft_TimeoutNow_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftServer is the server API for Raft service.
 // All implementations must embed UnimplementedRaftServer
 // for forward compatibility.
@@ -73,12 +102,19 @@ func (c *raftClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest
 // Raft is the node-to-node consensus protocol, deliberately a separate
 // service from the client-facing kv.v1: cluster internals and clients
 // never share a surface. Field semantics follow the Raft paper (Figure 2)
-// exactly; the one extension is the conflict_* fields on
-// AppendEntriesResponse, which let a leader skip whole conflicting terms
-// when repairing a follower's log instead of probing one entry per RPC.
+// exactly; extensions beyond the paper are called out on each field.
+//
+// Every request carries `group`: a node hosts one Raft group per shard,
+// and the group id routes the message to the right instance.
 type RaftServer interface {
 	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
 	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
+	// InstallSnapshot replaces a follower's entire state when the leader
+	// has already compacted the log entries the follower would need.
+	InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error)
+	// TimeoutNow asks the target to start an election immediately,
+	// implementing voluntary leadership transfer.
+	TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error)
 	mustEmbedUnimplementedRaftServer()
 }
 
@@ -94,6 +130,12 @@ func (UnimplementedRaftServer) RequestVote(context.Context, *RequestVoteRequest)
 }
 func (UnimplementedRaftServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
+}
+func (UnimplementedRaftServer) InstallSnapshot(context.Context, *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InstallSnapshot not implemented")
+}
+func (UnimplementedRaftServer) TimeoutNow(context.Context, *TimeoutNowRequest) (*TimeoutNowResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TimeoutNow not implemented")
 }
 func (UnimplementedRaftServer) mustEmbedUnimplementedRaftServer() {}
 func (UnimplementedRaftServer) testEmbeddedByValue()              {}
@@ -152,6 +194,42 @@ func _Raft_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Raft_InstallSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InstallSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServer).InstallSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Raft_InstallSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServer).InstallSnapshot(ctx, req.(*InstallSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Raft_TimeoutNow_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TimeoutNowRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftServer).TimeoutNow(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Raft_TimeoutNow_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftServer).TimeoutNow(ctx, req.(*TimeoutNowRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Raft_ServiceDesc is the grpc.ServiceDesc for Raft service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -166,6 +244,14 @@ var Raft_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AppendEntries",
 			Handler:    _Raft_AppendEntries_Handler,
+		},
+		{
+			MethodName: "InstallSnapshot",
+			Handler:    _Raft_InstallSnapshot_Handler,
+		},
+		{
+			MethodName: "TimeoutNow",
+			Handler:    _Raft_TimeoutNow_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

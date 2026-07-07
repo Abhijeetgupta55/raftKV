@@ -21,10 +21,17 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// client_id and serial implement exactly-once application of retried
+// writes. A client that resends after a timeout cannot know whether the
+// original was applied; the state machine remembers the highest serial
+// applied per client and returns the cached result for duplicates
+// instead of applying twice. client_id 0 opts out (at-least-once).
 type PutRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	ClientId      uint64                 `protobuf:"varint,3,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"`
+	Serial        uint64                 `protobuf:"varint,4,opt,name=serial,proto3" json:"serial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -71,6 +78,20 @@ func (x *PutRequest) GetValue() []byte {
 		return x.Value
 	}
 	return nil
+}
+
+func (x *PutRequest) GetClientId() uint64 {
+	if x != nil {
+		return x.ClientId
+	}
+	return 0
+}
+
+func (x *PutRequest) GetSerial() uint64 {
+	if x != nil {
+		return x.Serial
+	}
+	return 0
 }
 
 type PutResponse struct {
@@ -211,6 +232,8 @@ func (x *GetResponse) GetFound() bool {
 type DeleteRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	ClientId      uint64                 `protobuf:"varint,2,opt,name=client_id,json=clientId,proto3" json:"client_id,omitempty"` // see PutRequest
+	Serial        uint64                 `protobuf:"varint,3,opt,name=serial,proto3" json:"serial,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -250,6 +273,20 @@ func (x *DeleteRequest) GetKey() string {
 		return x.Key
 	}
 	return ""
+}
+
+func (x *DeleteRequest) GetClientId() uint64 {
+	if x != nil {
+		return x.ClientId
+	}
+	return 0
+}
+
+func (x *DeleteRequest) GetSerial() uint64 {
+	if x != nil {
+		return x.Serial
+	}
+	return 0
 }
 
 type DeleteResponse struct {
@@ -302,20 +339,24 @@ var File_proto_kv_v1_kv_proto protoreflect.FileDescriptor
 
 const file_proto_kv_v1_kv_proto_rawDesc = "" +
 	"\n" +
-	"\x14proto/kv/v1/kv.proto\x12\x05kv.v1\"4\n" +
+	"\x14proto/kv/v1/kv.proto\x12\x05kv.v1\"i\n" +
 	"\n" +
 	"PutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value\"\r\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1b\n" +
+	"\tclient_id\x18\x03 \x01(\x04R\bclientId\x12\x16\n" +
+	"\x06serial\x18\x04 \x01(\x04R\x06serial\"\r\n" +
 	"\vPutResponse\"\x1e\n" +
 	"\n" +
 	"GetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\"9\n" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x14\n" +
-	"\x05found\x18\x02 \x01(\bR\x05found\"!\n" +
+	"\x05found\x18\x02 \x01(\bR\x05found\"V\n" +
 	"\rDeleteRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\"*\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x1b\n" +
+	"\tclient_id\x18\x02 \x01(\x04R\bclientId\x12\x16\n" +
+	"\x06serial\x18\x03 \x01(\x04R\x06serial\"*\n" +
 	"\x0eDeleteResponse\x12\x18\n" +
 	"\aexisted\x18\x01 \x01(\bR\aexisted2\x97\x01\n" +
 	"\x02KV\x12,\n" +

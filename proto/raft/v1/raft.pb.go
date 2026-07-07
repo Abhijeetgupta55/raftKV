@@ -21,6 +21,66 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// EntryType separates what the state machine sees (NORMAL) from what
+// Raft itself consumes (NOOP, CONFIG).
+type EntryType int32
+
+const (
+	EntryType_ENTRY_TYPE_UNSPECIFIED EntryType = 0
+	// A client command, applied to the state machine.
+	EntryType_ENTRY_TYPE_NORMAL EntryType = 1
+	// Appended by every new leader at term start. Committing it commits
+	// everything before it (the Figure-8 rule forbids counting replicas of
+	// prior-term entries directly), and it establishes the commit floor
+	// ReadIndex needs before serving linearizable reads.
+	EntryType_ENTRY_TYPE_NOOP EntryType = 2
+	// A cluster membership change; consumed by Raft, not the state machine.
+	EntryType_ENTRY_TYPE_CONFIG EntryType = 3
+)
+
+// Enum value maps for EntryType.
+var (
+	EntryType_name = map[int32]string{
+		0: "ENTRY_TYPE_UNSPECIFIED",
+		1: "ENTRY_TYPE_NORMAL",
+		2: "ENTRY_TYPE_NOOP",
+		3: "ENTRY_TYPE_CONFIG",
+	}
+	EntryType_value = map[string]int32{
+		"ENTRY_TYPE_UNSPECIFIED": 0,
+		"ENTRY_TYPE_NORMAL":      1,
+		"ENTRY_TYPE_NOOP":        2,
+		"ENTRY_TYPE_CONFIG":      3,
+	}
+)
+
+func (x EntryType) Enum() *EntryType {
+	p := new(EntryType)
+	*p = x
+	return p
+}
+
+func (x EntryType) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (EntryType) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_raft_v1_raft_proto_enumTypes[0].Descriptor()
+}
+
+func (EntryType) Type() protoreflect.EnumType {
+	return &file_proto_raft_v1_raft_proto_enumTypes[0]
+}
+
+func (x EntryType) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use EntryType.Descriptor instead.
+func (EntryType) EnumDescriptor() ([]byte, []int) {
+	return file_proto_raft_v1_raft_proto_rawDescGZIP(), []int{0}
+}
+
 type RequestVoteRequest struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	Term        uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -28,8 +88,15 @@ type RequestVoteRequest struct {
 	// The election restriction (paper §5.4.1): voters compare this against
 	// their own log and refuse candidates that are behind, which is what
 	// makes "won an election" imply "holds every committed entry".
-	LastLogIndex  uint64 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastLogTerm   uint64 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	LastLogIndex uint64 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm  uint64 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	// pre_vote = true asks "would you vote for me?" without any state
+	// change on either side: the term is not incremented and the answer is
+	// not remembered. A node rejoining after a partition probes with
+	// pre-votes first, so it cannot bump the cluster's term and depose a
+	// healthy leader just by having been away.
+	PreVote       bool   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
+	Group         uint64 `protobuf:"varint,6,opt,name=group,proto3" json:"group,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -88,6 +155,20 @@ func (x *RequestVoteRequest) GetLastLogIndex() uint64 {
 func (x *RequestVoteRequest) GetLastLogTerm() uint64 {
 	if x != nil {
 		return x.LastLogTerm
+	}
+	return 0
+}
+
+func (x *RequestVoteRequest) GetPreVote() bool {
+	if x != nil {
+		return x.PreVote
+	}
+	return false
+}
+
+func (x *RequestVoteRequest) GetGroup() uint64 {
+	if x != nil {
+		return x.Group
 	}
 	return 0
 }
@@ -155,6 +236,7 @@ type LogEntry struct {
 	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	Index         uint64                 `protobuf:"varint,2,opt,name=index,proto3" json:"index,omitempty"`
 	Command       []byte                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
+	Type          EntryType              `protobuf:"varint,4,opt,name=type,proto3,enum=raft.v1.EntryType" json:"type,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -210,6 +292,13 @@ func (x *LogEntry) GetCommand() []byte {
 	return nil
 }
 
+func (x *LogEntry) GetType() EntryType {
+	if x != nil {
+		return x.Type
+	}
+	return EntryType_ENTRY_TYPE_UNSPECIFIED
+}
+
 type AppendEntriesRequest struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Term     uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
@@ -217,10 +306,16 @@ type AppendEntriesRequest struct {
 	// The log-matching check: the follower must hold an entry at
 	// prev_log_index with term prev_log_term or reject, which is the
 	// induction step that keeps all logs identical up to any shared point.
-	PrevLogIndex  uint64      `protobuf:"varint,3,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
-	PrevLogTerm   uint64      `protobuf:"varint,4,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
-	Entries       []*LogEntry `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"` // empty for pure heartbeats
-	LeaderCommit  uint64      `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	PrevLogIndex uint64      `protobuf:"varint,3,opt,name=prev_log_index,json=prevLogIndex,proto3" json:"prev_log_index,omitempty"`
+	PrevLogTerm  uint64      `protobuf:"varint,4,opt,name=prev_log_term,json=prevLogTerm,proto3" json:"prev_log_term,omitempty"`
+	Entries      []*LogEntry `protobuf:"bytes,5,rep,name=entries,proto3" json:"entries,omitempty"` // empty for pure heartbeats
+	LeaderCommit uint64      `protobuf:"varint,6,opt,name=leader_commit,json=leaderCommit,proto3" json:"leader_commit,omitempty"`
+	Group        uint64      `protobuf:"varint,7,opt,name=group,proto3" json:"group,omitempty"`
+	// Monotonic per-leader send sequence, echoed back in the response.
+	// ReadIndex uses it to distinguish "an ack generated after my read
+	// was registered" (proof of current leadership) from a stale ack
+	// that was already in flight.
+	Seq           uint64 `protobuf:"varint,8,opt,name=seq,proto3" json:"seq,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -297,10 +392,25 @@ func (x *AppendEntriesRequest) GetLeaderCommit() uint64 {
 	return 0
 }
 
+func (x *AppendEntriesRequest) GetGroup() uint64 {
+	if x != nil {
+		return x.Group
+	}
+	return 0
+}
+
+func (x *AppendEntriesRequest) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
 type AppendEntriesResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Term    uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
 	Success bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	Seq     uint64                 `protobuf:"varint,5,opt,name=seq,proto3" json:"seq,omitempty"` // echo of AppendEntriesRequest.seq
 	// On rejection: the term of the conflicting entry (0 if the follower's
 	// log is simply too short) and the first index the follower holds for
 	// that term. The leader uses these to move nextIndex back a whole term
@@ -355,6 +465,13 @@ func (x *AppendEntriesResponse) GetSuccess() bool {
 	return false
 }
 
+func (x *AppendEntriesResponse) GetSeq() uint64 {
+	if x != nil {
+		return x.Seq
+	}
+	return 0
+}
+
 func (x *AppendEntriesResponse) GetConflictTerm() uint64 {
 	if x != nil {
 		return x.ConflictTerm
@@ -369,38 +486,305 @@ func (x *AppendEntriesResponse) GetConflictIndex() uint64 {
 	return 0
 }
 
+type InstallSnapshotRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Term     uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId uint64                 `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	// The snapshot replaces the log through this point.
+	LastIncludedIndex uint64 `protobuf:"varint,3,opt,name=last_included_index,json=lastIncludedIndex,proto3" json:"last_included_index,omitempty"`
+	LastIncludedTerm  uint64 `protobuf:"varint,4,opt,name=last_included_term,json=lastIncludedTerm,proto3" json:"last_included_term,omitempty"`
+	// Complete snapshot in one message (no chunking). Snapshots are state
+	// machine images bounded by the service-layer size limits; if they
+	// ever outgrow a single gRPC message this becomes a stream.
+	Data []byte `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`
+	// The cluster membership as of last_included_index, so a fresh node
+	// learns the config from the snapshot alone.
+	Config        []byte `protobuf:"bytes,6,opt,name=config,proto3" json:"config,omitempty"`
+	Group         uint64 `protobuf:"varint,7,opt,name=group,proto3" json:"group,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotRequest) Reset() {
+	*x = InstallSnapshotRequest{}
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotRequest) ProtoMessage() {}
+
+func (x *InstallSnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotRequest.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_proto_raft_v1_raft_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *InstallSnapshotRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLeaderId() uint64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedIndex() uint64 {
+	if x != nil {
+		return x.LastIncludedIndex
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetLastIncludedTerm() uint64 {
+	if x != nil {
+		return x.LastIncludedTerm
+	}
+	return 0
+}
+
+func (x *InstallSnapshotRequest) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *InstallSnapshotRequest) GetConfig() []byte {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+func (x *InstallSnapshotRequest) GetGroup() uint64 {
+	if x != nil {
+		return x.Group
+	}
+	return 0
+}
+
+type InstallSnapshotResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InstallSnapshotResponse) Reset() {
+	*x = InstallSnapshotResponse{}
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InstallSnapshotResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InstallSnapshotResponse) ProtoMessage() {}
+
+func (x *InstallSnapshotResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InstallSnapshotResponse.ProtoReflect.Descriptor instead.
+func (*InstallSnapshotResponse) Descriptor() ([]byte, []int) {
+	return file_proto_raft_v1_raft_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *InstallSnapshotResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+type TimeoutNowRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId      uint64                 `protobuf:"varint,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	Group         uint64                 `protobuf:"varint,3,opt,name=group,proto3" json:"group,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowRequest) Reset() {
+	*x = TimeoutNowRequest{}
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowRequest) ProtoMessage() {}
+
+func (x *TimeoutNowRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowRequest.ProtoReflect.Descriptor instead.
+func (*TimeoutNowRequest) Descriptor() ([]byte, []int) {
+	return file_proto_raft_v1_raft_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *TimeoutNowRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *TimeoutNowRequest) GetLeaderId() uint64 {
+	if x != nil {
+		return x.LeaderId
+	}
+	return 0
+}
+
+func (x *TimeoutNowRequest) GetGroup() uint64 {
+	if x != nil {
+		return x.Group
+	}
+	return 0
+}
+
+type TimeoutNowResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TimeoutNowResponse) Reset() {
+	*x = TimeoutNowResponse{}
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TimeoutNowResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TimeoutNowResponse) ProtoMessage() {}
+
+func (x *TimeoutNowResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raft_v1_raft_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TimeoutNowResponse.ProtoReflect.Descriptor instead.
+func (*TimeoutNowResponse) Descriptor() ([]byte, []int) {
+	return file_proto_raft_v1_raft_proto_rawDescGZIP(), []int{8}
+}
+
 var File_proto_raft_v1_raft_proto protoreflect.FileDescriptor
 
 const file_proto_raft_v1_raft_proto_rawDesc = "" +
 	"\n" +
-	"\x18proto/raft/v1/raft.proto\x12\araft.v1\"\x95\x01\n" +
+	"\x18proto/raft/v1/raft.proto\x12\araft.v1\"\xc6\x01\n" +
 	"\x12RequestVoteRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\x04R\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
-	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\"L\n" +
+	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
+	"\bpre_vote\x18\x05 \x01(\bR\apreVote\x12\x14\n" +
+	"\x05group\x18\x06 \x01(\x04R\x05group\"L\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
-	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"N\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"v\n" +
 	"\bLogEntry\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12\x18\n" +
-	"\acommand\x18\x03 \x01(\fR\acommand\"\xe3\x01\n" +
+	"\acommand\x18\x03 \x01(\fR\acommand\x12&\n" +
+	"\x04type\x18\x04 \x01(\x0e2\x12.raft.v1.EntryTypeR\x04type\"\x8b\x02\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12$\n" +
 	"\x0eprev_log_index\x18\x03 \x01(\x04R\fprevLogIndex\x12\"\n" +
 	"\rprev_log_term\x18\x04 \x01(\x04R\vprevLogTerm\x12+\n" +
 	"\aentries\x18\x05 \x03(\v2\x11.raft.v1.LogEntryR\aentries\x12#\n" +
-	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\"\x91\x01\n" +
+	"\rleader_commit\x18\x06 \x01(\x04R\fleaderCommit\x12\x14\n" +
+	"\x05group\x18\a \x01(\x04R\x05group\x12\x10\n" +
+	"\x03seq\x18\b \x01(\x04R\x03seq\"\xa3\x01\n" +
 	"\x15AppendEntriesResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\x12#\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\x12\x10\n" +
+	"\x03seq\x18\x05 \x01(\x04R\x03seq\x12#\n" +
 	"\rconflict_term\x18\x03 \x01(\x04R\fconflictTerm\x12%\n" +
-	"\x0econflict_index\x18\x04 \x01(\x04R\rconflictIndex2\xa0\x01\n" +
+	"\x0econflict_index\x18\x04 \x01(\x04R\rconflictIndex\"\xe9\x01\n" +
+	"\x16InstallSnapshotRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12.\n" +
+	"\x13last_included_index\x18\x03 \x01(\x04R\x11lastIncludedIndex\x12,\n" +
+	"\x12last_included_term\x18\x04 \x01(\x04R\x10lastIncludedTerm\x12\x12\n" +
+	"\x04data\x18\x05 \x01(\fR\x04data\x12\x16\n" +
+	"\x06config\x18\x06 \x01(\fR\x06config\x12\x14\n" +
+	"\x05group\x18\a \x01(\x04R\x05group\"-\n" +
+	"\x17InstallSnapshotResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\"Z\n" +
+	"\x11TimeoutNowRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x02 \x01(\x04R\bleaderId\x12\x14\n" +
+	"\x05group\x18\x03 \x01(\x04R\x05group\"\x14\n" +
+	"\x12TimeoutNowResponse*j\n" +
+	"\tEntryType\x12\x1a\n" +
+	"\x16ENTRY_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
+	"\x11ENTRY_TYPE_NORMAL\x10\x01\x12\x13\n" +
+	"\x0fENTRY_TYPE_NOOP\x10\x02\x12\x15\n" +
+	"\x11ENTRY_TYPE_CONFIG\x10\x032\xbd\x02\n" +
 	"\x04Raft\x12H\n" +
 	"\vRequestVote\x12\x1b.raft.v1.RequestVoteRequest\x1a\x1c.raft.v1.RequestVoteResponse\x12N\n" +
-	"\rAppendEntries\x12\x1d.raft.v1.AppendEntriesRequest\x1a\x1e.raft.v1.AppendEntriesResponseB8Z6github.com/Abhijeetgupta55/raftkv/proto/raft/v1;raftv1b\x06proto3"
+	"\rAppendEntries\x12\x1d.raft.v1.AppendEntriesRequest\x1a\x1e.raft.v1.AppendEntriesResponse\x12T\n" +
+	"\x0fInstallSnapshot\x12\x1f.raft.v1.InstallSnapshotRequest\x1a .raft.v1.InstallSnapshotResponse\x12E\n" +
+	"\n" +
+	"TimeoutNow\x12\x1a.raft.v1.TimeoutNowRequest\x1a\x1b.raft.v1.TimeoutNowResponseB8Z6github.com/Abhijeetgupta55/raftkv/proto/raft/v1;raftv1b\x06proto3"
 
 var (
 	file_proto_raft_v1_raft_proto_rawDescOnce sync.Once
@@ -414,25 +798,36 @@ func file_proto_raft_v1_raft_proto_rawDescGZIP() []byte {
 	return file_proto_raft_v1_raft_proto_rawDescData
 }
 
-var file_proto_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_proto_raft_v1_raft_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_raft_v1_raft_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_proto_raft_v1_raft_proto_goTypes = []any{
-	(*RequestVoteRequest)(nil),    // 0: raft.v1.RequestVoteRequest
-	(*RequestVoteResponse)(nil),   // 1: raft.v1.RequestVoteResponse
-	(*LogEntry)(nil),              // 2: raft.v1.LogEntry
-	(*AppendEntriesRequest)(nil),  // 3: raft.v1.AppendEntriesRequest
-	(*AppendEntriesResponse)(nil), // 4: raft.v1.AppendEntriesResponse
+	(EntryType)(0),                  // 0: raft.v1.EntryType
+	(*RequestVoteRequest)(nil),      // 1: raft.v1.RequestVoteRequest
+	(*RequestVoteResponse)(nil),     // 2: raft.v1.RequestVoteResponse
+	(*LogEntry)(nil),                // 3: raft.v1.LogEntry
+	(*AppendEntriesRequest)(nil),    // 4: raft.v1.AppendEntriesRequest
+	(*AppendEntriesResponse)(nil),   // 5: raft.v1.AppendEntriesResponse
+	(*InstallSnapshotRequest)(nil),  // 6: raft.v1.InstallSnapshotRequest
+	(*InstallSnapshotResponse)(nil), // 7: raft.v1.InstallSnapshotResponse
+	(*TimeoutNowRequest)(nil),       // 8: raft.v1.TimeoutNowRequest
+	(*TimeoutNowResponse)(nil),      // 9: raft.v1.TimeoutNowResponse
 }
 var file_proto_raft_v1_raft_proto_depIdxs = []int32{
-	2, // 0: raft.v1.AppendEntriesRequest.entries:type_name -> raft.v1.LogEntry
-	0, // 1: raft.v1.Raft.RequestVote:input_type -> raft.v1.RequestVoteRequest
-	3, // 2: raft.v1.Raft.AppendEntries:input_type -> raft.v1.AppendEntriesRequest
-	1, // 3: raft.v1.Raft.RequestVote:output_type -> raft.v1.RequestVoteResponse
-	4, // 4: raft.v1.Raft.AppendEntries:output_type -> raft.v1.AppendEntriesResponse
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	0, // 0: raft.v1.LogEntry.type:type_name -> raft.v1.EntryType
+	3, // 1: raft.v1.AppendEntriesRequest.entries:type_name -> raft.v1.LogEntry
+	1, // 2: raft.v1.Raft.RequestVote:input_type -> raft.v1.RequestVoteRequest
+	4, // 3: raft.v1.Raft.AppendEntries:input_type -> raft.v1.AppendEntriesRequest
+	6, // 4: raft.v1.Raft.InstallSnapshot:input_type -> raft.v1.InstallSnapshotRequest
+	8, // 5: raft.v1.Raft.TimeoutNow:input_type -> raft.v1.TimeoutNowRequest
+	2, // 6: raft.v1.Raft.RequestVote:output_type -> raft.v1.RequestVoteResponse
+	5, // 7: raft.v1.Raft.AppendEntries:output_type -> raft.v1.AppendEntriesResponse
+	7, // 8: raft.v1.Raft.InstallSnapshot:output_type -> raft.v1.InstallSnapshotResponse
+	9, // 9: raft.v1.Raft.TimeoutNow:output_type -> raft.v1.TimeoutNowResponse
+	6, // [6:10] is the sub-list for method output_type
+	2, // [2:6] is the sub-list for method input_type
+	2, // [2:2] is the sub-list for extension type_name
+	2, // [2:2] is the sub-list for extension extendee
+	0, // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_proto_raft_v1_raft_proto_init() }
@@ -445,13 +840,14 @@ func file_proto_raft_v1_raft_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raft_v1_raft_proto_rawDesc), len(file_proto_raft_v1_raft_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   5,
+			NumEnums:      1,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_proto_raft_v1_raft_proto_goTypes,
 		DependencyIndexes: file_proto_raft_v1_raft_proto_depIdxs,
+		EnumInfos:         file_proto_raft_v1_raft_proto_enumTypes,
 		MessageInfos:      file_proto_raft_v1_raft_proto_msgTypes,
 	}.Build()
 	File_proto_raft_v1_raft_proto = out.File

@@ -8,15 +8,20 @@ import (
 	"testing"
 
 	"github.com/Abhijeetgupta55/raftkv/internal/record"
+	raftv1 "github.com/Abhijeetgupta55/raftkv/proto/raft/v1"
 )
 
 func entry(term, index uint64, command string) Entry {
-	return Entry{Term: term, Index: index, Command: []byte(command)}
+	return Entry{
+		Term: term, Index: index,
+		Type:    raftv1.EntryType_ENTRY_TYPE_NORMAL,
+		Command: []byte(command),
+	}
 }
 
 func mustOpenLog(t *testing.T, dir string) (*logStore, []Entry) {
 	t.Helper()
-	ls, entries, err := openLog(dir)
+	ls, entries, err := openLog(dir, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +36,7 @@ func assertEntries(t *testing.T, got, want []Entry) {
 	}
 	for i := range want {
 		g, w := got[i], want[i]
-		if g.Term != w.Term || g.Index != w.Index || !bytes.Equal(g.Command, w.Command) {
+		if g.Term != w.Term || g.Index != w.Index || g.Type != w.Type || !bytes.Equal(g.Command, w.Command) {
 			t.Fatalf("entry %d = %+v, want %+v", i, g, w)
 		}
 	}
@@ -157,7 +162,7 @@ func TestIndexGapInFileIsFatal(t *testing.T) {
 	dir := t.TempDir()
 	writeRawEntries(t, dir, entry(1, 1, "a"), entry(1, 3, "gap"))
 
-	if _, _, err := openLog(dir); err == nil {
+	if _, _, err := openLog(dir, 0); err == nil {
 		t.Fatal("openLog accepted a log with an index gap")
 	}
 }
@@ -166,7 +171,7 @@ func TestLogNotStartingAtOneIsFatal(t *testing.T) {
 	dir := t.TempDir()
 	writeRawEntries(t, dir, entry(1, 2, "headless"))
 
-	if _, _, err := openLog(dir); err == nil {
+	if _, _, err := openLog(dir, 0); err == nil {
 		t.Fatal("openLog accepted a log that lost its head")
 	}
 }
@@ -199,6 +204,7 @@ func writeRawEntries(t *testing.T, dir string, entries ...Entry) {
 		p := make([]byte, 0, entryHeaderLen+len(e.Command))
 		p = appendUint64(p, e.Term)
 		p = appendUint64(p, e.Index)
+		p = append(p, byte(e.Type))
 		p = append(p, e.Command...)
 		buf = record.Frame(buf, p)
 	}

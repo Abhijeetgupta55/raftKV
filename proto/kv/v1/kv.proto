@@ -20,9 +20,16 @@ service KV {
 // values are opaque bytes because the store has no business interpreting
 // them. See docs/DECISIONS/0002 for the trade-off discussion.
 
+// client_id and serial implement exactly-once application of retried
+// writes. A client that resends after a timeout cannot know whether the
+// original was applied; the state machine remembers the highest serial
+// applied per client and returns the cached result for duplicates
+// instead of applying twice. client_id 0 opts out (at-least-once).
 message PutRequest {
   string key = 1;
   bytes value = 2;
+  uint64 client_id = 3;
+  uint64 serial = 4;
 }
 
 message PutResponse {
@@ -44,6 +51,8 @@ message GetResponse {
 
 message DeleteRequest {
   string key = 1;
+  uint64 client_id = 2; // see PutRequest
+  uint64 serial = 3;
 }
 
 message DeleteResponse {

@@ -20,6 +20,11 @@ func newTestCore(t *testing.T) *core {
 		PeerIDs: []uint64{2, 3},
 		DataDir: t.TempDir(),
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// These tests exercise the base Raft election path (term
+		// increment, RequestVote fan-out, split-vote retry). Pre-vote is
+		// tested at the node level; disable it here so tickToCampaign's
+		// term-increment detection works.
+		DisablePreVote: true,
 	}, 42)
 	if err != nil {
 		t.Fatal(err)
@@ -403,4 +408,92 @@ func TestPersistFailureSurfacesAsError(t *testing.T) {
 		}
 	}
 	t.Fatal("campaign started without durable candidacy")
+}
+
+// newPreVoteCore builds a 3-node core with pre-vote ENABLED (unlike
+// newTestCore), for exercising the pre-vote leader-recency guard.
+func newPreVoteCore(t *testing.T) *core {
+	t.Helper()
+	c, err := newCore(Config{
+		ID:      1,
+		PeerIDs: []uint64{2, 3},
+		DataDir: t.TempDir(),
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.close() })
+	return c
+}
+
+// TestPreVoteGrantedOnlyAfterLeaderSilence is the regression test for the
+// failover liveness bug: a follower that still remembers a leader must
+// keep refusing pre-votes while that leader is fresh, but MUST start
+// granting them once it has gone ElectionTicksMin ticks without contact —
+// otherwise two survivors of a leader partition veto each other forever
+// and no new leader is ever elected. The recency measure is
+// ticksSinceLeader, which (unlike electionElapsed) starting a campaign or
+// granting a vote does not reset.
+func TestPreVoteGrantedOnlyAfterLeaderSilence(t *testing.T) {
+	c := newPreVoteCore(t)
+	c.term = 5
+	c.leaderID = 2         // we recognize node 2 as leader...
+	c.ticksSinceLeader = 0 // ...and just heard from it.
+
+	probe := &raftv1.RequestVoteRequest{
+		Term: c.term + 1, CandidateId: 3,
+		LastLogIndex: c.lastLogIndex(), LastLogTerm: c.lastLogTerm(),
+		PreVote: true,
+	}
+
+	// Fresh leader: refuse, so a healthy cluster isn't disrupted.
+	if resp := c.handlePreVote(probe); resp.GetVoteGranted() {
+		t.Fatal("granted a pre-vote while the leader was fresh — a live cluster can be disrupted")
+	}
+
+	// Simulate the leader vanishing: ticks pass with no AppendEntries.
+	// Crucially, also start a pre-campaign in between (which resets
+	// electionElapsed) to prove that does NOT suppress the grant.
+	for i := 0; i < c.cfg.ElectionTicksMin; i++ {
+		if err := c.tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if resp := c.handlePreVote(probe); !resp.GetVoteGranted() {
+		t.Fatalf("refused a pre-vote after %d ticks of leader silence — failover would stall (ticksSinceLeader=%d)",
+			c.cfg.ElectionTicksMin, c.ticksSinceLeader)
+	}
+}
+
+// TestGenuineLeaderContactResetsRecency proves the recency counter is
+// reset by real AppendEntries contact — so a leader that keeps
+// heartbeating keeps its followers refusing disruptive pre-votes.
+func TestGenuineLeaderContactResetsRecency(t *testing.T) {
+	c := newPreVoteCore(t)
+	c.term = 5
+	c.leaderID = 2
+	// Age out the recency window.
+	for i := 0; i < c.cfg.ElectionTicksMin+1; i++ {
+		if err := c.tick(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A heartbeat from the leader arrives.
+	if _, err := c.handleAppendEntries(&raftv1.AppendEntriesRequest{
+		Term: 5, LeaderId: 2, PrevLogIndex: 0, PrevLogTerm: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if c.ticksSinceLeader != 0 {
+		t.Fatalf("leader contact left ticksSinceLeader=%d, want 0", c.ticksSinceLeader)
+	}
+	probe := &raftv1.RequestVoteRequest{
+		Term: 6, CandidateId: 3,
+		LastLogIndex: c.lastLogIndex(), LastLogTerm: c.lastLogTerm(), PreVote: true,
+	}
+	if resp := c.handlePreVote(probe); resp.GetVoteGranted() {
+		t.Fatal("granted a pre-vote right after a fresh heartbeat — leader stickiness broken")
+	}
 }
