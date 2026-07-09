@@ -102,6 +102,58 @@ ambiguity is a documented limitation, pinned by a test.
   disks returning plausible-but-wrong data — CRCs catch bit rot, not
   adversaries).
 
+## Sharding (M5): multiple independent Raft groups
+
+Horizontal scale comes from partitioning the keyspace across independent
+Raft groups ("shards"), each with its own leader, log, snapshots, and
+membership. Raft is completely unaware of this: a group replicates opaque
+bytes exactly as before; sharding is purely a routing layer above it.
+
+**Partitioning: hash, not range.** A key's shard is
+`fnv1a64(key) % shardCount` (`kvraft.ShardFor`). Chosen because it gives
+uniform load with zero knowledge of the key distribution, O(1) stateless
+routing (any node, any client can compute it), and no shard-map metadata
+service. The honest cost: no efficient range scans (a scan would fan out
+to every shard) and no locality for related keys. Range partitioning wins
+when scans matter and enables targeted shard-splitting of hot ranges, but
+needs split/merge management and a shard-map service — the wrong
+complexity for a KV API that today has no scan operation. If scans arrive,
+this decision gets revisited (ADR-worthy).
+
+**Shard count is static** (`--shards N`, fixed at cluster birth; every node
+must agree). Changing it re-maps `hash % N` for almost every key, so
+resharding = dual-write migration or consistent hashing with virtual
+nodes — documented future work, deliberately not built: the systems
+substance here is multi-group consensus, not online resharding.
+A `shards` file in the data root pins the count and refuses startup on
+mismatch, so a mis-flagged restart cannot silently route keys to the
+wrong group's log.
+
+**Placement is static and total**: every node hosts a replica of every
+shard (same member set per group). With N nodes and S shards that is S
+independent quorums over the same machines — real independence of
+elections/commit, not real hardware isolation. A placement map (subset of
+nodes per shard) is future work; the `Group` field on every Raft RPC and
+the group-keyed `raft.Service` already support it.
+
+**Routing is two-layer.** Server-side: any node computes the shard from
+the key and serves it from its local replica of that group — leader check
+included; a follower rejects with a hint naming both the shard and its
+leader (`shard=K leader_addr=…`). Client-side: the CLI computes nothing;
+it caches leader address **per shard** from those hints and invalidates
+the entry on the next NotLeader for that shard. One shard's failover
+does not evict another shard's perfectly good cached leader.
+
+**One process, many groups — the starvation question.** Each group's
+event loop is its own goroutine (that is the per-group apply bound), but
+*time* is shared: a single ticker goroutine drives `Tick()` on every
+local group in round-robin (each node is created with `TickInterval: 0`).
+One misbehaving group cannot stall another group's elections by hogging a
+timer, because ticks are delivered as non-blocking enqueues onto each
+group's own message channel. What the shared ticker costs: tick delivery
+skew of at most the loop iteration time (microseconds for tens of groups),
+which is noise against 10–20-tick election timeouts.
+
 ## The five safety properties, mapped to code (M2–M3)
 
 Raft's correctness rests on five properties (paper §5.2–§5.4). Where each
@@ -208,18 +260,40 @@ exactly that moment.
 
 ### Added / deferred at Milestones 2–4 (see STATUS.md for the full ledger)
 
-- **The Raft library is not yet wired into the server binary.** The
-  consensus core, replication, snapshots, membership, pre-vote,
-  leadership transfer, and ReadIndex are all implemented and tested at the
-  library level, but `internal/server`/`cmd/server` still run the M1
-  single-node `DurableStore`. The distributed store is not yet reachable
-  over gRPC end-to-end; that integration is the next milestone's first
-  task.
-- **No client-session dedup yet (M4 incomplete).** ReadIndex gives
-  linearizable *reads*, but there is no exactly-once write path: a client
-  whose `Propose` times out and retries can double-apply if the original
-  later commits. Session serials stored inside the replicated state
-  machine (and its snapshots) are the planned fix and are not yet built.
+- **Raft is wired into the server only in cluster mode.** With `--peers`,
+  `cmd/server` runs the Raft-backed KV service (`internal/kvraft`) over
+  real gRPC, proven end-to-end by the `test/cluster` kill-9 failover test.
+  Without `--peers` it runs the unchanged M1 durable single-node store.
+  Deliberate: a single node needs durability, not consensus. A one-command
+  way to *bootstrap* a fresh multi-node cluster's membership (beyond static
+  `--peers`) is not yet provided.
+- **`Delete` reports `existed` best-effort.** It reads the leader's applied
+  state just before proposing, so under concurrency the flag can be
+  slightly stale. A linearizable answer needs `StateMachine.Apply` to
+  return a result to the proposer; deferred.
+- **Read-path sessions not implemented.** Writes are exactly-once via the
+  session table; reads are not cached per session (they are idempotent, so
+  this affects only a hypothetical read-your-writes-token API, not
+  correctness).
+- **Leader hint travels in the gRPC status message** (`shard=… leader_addr=…`,
+  string-parsed by the client) rather than a typed error detail — a
+  pragmatic choice to avoid a proto change; a structured detail is the
+  clean version.
+
+### Added at Milestone 5 (sharding)
+
+- **Shard count is fixed for the life of the data dir.** Pinned in
+  `dataRoot/shards`; changing it means a new cluster and a migration.
+  Online resharding (consistent hashing / shard splits with dual-write
+  cutover) is sketched in the sharding section and deliberately not built.
+- **Placement is total** — every node replicates every shard. Real
+  placement (subsets of nodes per shard, balancing, rebalancing on
+  add/remove) is future work; the group-keyed plumbing supports it.
+- **No cross-shard operations of any kind.** Each key is linearizable
+  within its shard; nothing orders writes on different shards relative to
+  each other. Multi-key transactions would need 2PC or similar above Raft.
+- **A future scan/range API would fan out to every shard** — the known
+  cost of hash partitioning, accepted because the API has no scans today.
 - **Snapshot restore reloads the whole state machine** (`Restore` replaces
   it wholesale). Fine at test scale; a streaming/chunked InstallSnapshot
   is the known fix for large state.

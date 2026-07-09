@@ -27,6 +27,16 @@ type Command struct {
 	Value []byte // ignored for OpDelete
 }
 
+// EncodeCommand returns the self-contained wire form of c. It is the
+// exported entry point the Raft layer uses to turn a mutation into the
+// opaque bytes it replicates; DecodeCommand reverses it in the state
+// machine's apply path.
+func EncodeCommand(c Command) []byte { return encodeCommand(nil, c) }
+
+// DecodeCommand parses bytes produced by EncodeCommand. The returned
+// Value aliases b; retain-and-mutate callers must copy (MemStore.Put does).
+func DecodeCommand(b []byte) (Command, error) { return decodeCommand(b) }
+
 // encodeCommand appends the wire form of c to buf and returns the
 // extended slice, so callers can reuse one buffer across appends.
 func encodeCommand(buf []byte, c Command) []byte {

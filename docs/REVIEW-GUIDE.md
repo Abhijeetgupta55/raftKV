@@ -198,3 +198,138 @@ time rule in `proposeConfChange`.
 **Q7. What in this codebase is NOT proven, and how would you attack it
 first?** (Answer honestly from STATUS.md: server wiring, session dedup,
 M5/M6/M7.) The honest answer is the strong answer in an interview.
+
+---
+
+## §7. Server wiring + M4 sessions (added session 3)
+
+Read in order:
+1. `internal/kvraft/statemachine.go` — the command envelope
+   `(clientID, serial, inner)` and the replicated `stateMachine`
+   (KV map + session table), implementing `raft.StateMachine`.
+2. `internal/kvraft/service.go` — `KVService` on top of `raft.Node`:
+   `Put`/`Delete` → `Propose`, `Get` → `ReadBarrier`, `toStatus` for
+   leader hints.
+3. `cmd/server/main.go` — the standalone-vs-cluster branch and how the
+   `kvv1` + `raftv1` services share one listener.
+4. `cmd/cli/main.go` — `leaderClient.retry` following `leader_addr=` hints.
+5. `test/cluster/cluster_test.go` — the real-process acceptance test.
+
+Invariants and where enforced:
+- **A write is durable + replicated before it is acknowledged.**
+  `KVService.Put` blocks on `node.Propose`, which returns only once the
+  entry is applied on this (leader) node — i.e. committed by a majority.
+  Proven end-to-end by `TestClusterFailoverNoAckedLoss` (kill -9 the
+  leader; every acked write survives).
+- **Reads are linearizable.** `KVService.Get` calls `node.ReadBarrier`
+  before touching the state machine; a deposed leader fails the barrier.
+- **A follower never silently serves/accepts.** `toStatus` maps
+  `raft.NotLeaderError` to `FailedPrecondition` with `leader_addr=`; the
+  CLI/test client retries there.
+- **Exactly-once writes.** `stateMachine.Apply` drops a `(clientID, serial)`
+  it has already applied; the table is snapshot-included. Proven by the
+  `internal/kvraft` test pair.
+- **M1 durability is untouched.** No `--peers` → the original
+  `storage.DurableStore` path; `test/crash` still passes unmodified.
+
+Deviations / shortcuts (all in STATUS.md Known Limitations): `Delete.Existed`
+is best-effort; read-path session caching is not implemented (writes dedup,
+reads are idempotent); the leader hint travels in the status *message*
+(string-parsed) rather than a typed gRPC detail, to avoid a proto change.
+
+### Checkpoint questions (session-3 additions)
+
+**Q8. When `KVService.Put` returns nil to the client, what is guaranteed?**
+A. The command is in the Raft log on a majority of nodes and has been
+applied to this leader's state machine — so it survives the loss of any
+minority, including this leader. `Propose` doesn't return until the entry
+commits and applies; a timeout instead returns an *unknown* outcome, which
+is exactly why writes carry `(client_id, serial)` for a safe retry.
+
+**Q9. A client sends Put, times out, and retries — but between the two a
+different client overwrote the key. Why doesn't the retry clobber the newer
+value?**
+A. Both of the first client's attempts carry the same `(client_id, serial)`.
+The state machine recorded that serial as applied on the first delivery, so
+the retry's `Apply` is a no-op — the newer client's write stands. Without
+the session id (client_id 0) the retry *would* clobber; that contrast is
+the `TestRetryWithoutSessionClobbers` → `TestSessionDedupPreventsStaleRetry`
+pair.
+
+**Q10. Why must the session table be in the snapshot?**
+A. If a replica restored from a snapshot forgot which serials it had
+applied, a duplicate arriving after the snapshot boundary would re-apply —
+breaking exactly-once across compaction/InstallSnapshot. `snapshotImage`
+carries both the data and the sessions; `TestSnapshotIncludesSessions`
+pins it.
+
+**Q11. Why keep a standalone durable path instead of always running Raft?**
+A. A single node needs durability, not consensus; paying election +
+replication overhead for one node is waste, and it lets the M1 crash test
+keep exercising the WAL/snapshot/torn-write engine directly. `--peers`
+selects Raft; its absence selects the M1 store. Same binary, same KV API.
+
+---
+
+## §8. Sharding — multi-Raft (RUN 1)
+
+Read in order:
+1. DESIGN.md "Sharding (M5)" — the decisions (hash vs range, static count,
+   total placement, shared ticker) with trade-offs.
+2. `internal/kvraft/sharding.go` — `ShardFor`, `NewSharded` (per-shard
+   dirs, shard-count pin, shared `tickLoop`), `ShardedKV` routing.
+3. `internal/kvraft/service.go` — the `shard=K leader_addr=A` hint.
+4. `cmd/cli/main.go` — `leaderClient` per-shard cache + invalidation.
+5. `test/cluster/sharded_test.go` — the real-process acceptance gate.
+
+Invariants and where enforced:
+- **A key routes to exactly one group, forever.** `ShardFor` is a pure
+  function of (key, shardCount); shardCount is pinned on disk
+  (`pinShardCount`) and a mismatched restart refuses to boot. →
+  `TestShardDistribution`, `TestShardCountPinRefusesMismatch`.
+- **Groups are independent.** Each has its own log, snapshots, elections,
+  quorum (`Group` stamped on every RPC; `raft.Service` routes by it). →
+  `TestShardsSurviveNodeLossIndependently`.
+- **One clock, many groups.** `ShardedServer.tickLoop` fans a single
+  ticker out as non-blocking enqueues; no per-group timer goroutines.
+- **Zero acked loss under multi-shard node death.** →
+  `TestShardedClusterFailoverNoAckedLoss` (real processes, kill -9).
+
+### Checkpoint questions (RUN-1 gate)
+
+**Q12. Trace a Put whose shard leader moved mid-flight.**
+A. Client sends Put(k) to its cached leader for shard g=ShardFor(k). That
+node's group-g replica is no longer leader, so `Propose` returns
+`NotLeaderError`; `toStatus` turns it into FailedPrecondition with
+`shard=g leader_id=… leader_addr=…` (the *new* leader, learned from the
+rejecting node's `leaderID`). The client invalidates its stale cache entry
+for g (and only g), stores the hinted address, and retries there. If the
+hint is empty (election still in flight), the client rotates nodes until a
+rejection carries a hint or the op lands. The write itself is safe under
+all of this because the entry commits in exactly one group's log — retries
+are deduped by (client_id, serial) in that group's state machine.
+
+**Q13. What does multi-group buy, and what does it cost?**
+A. Buys: write throughput scales with groups (S leaders commit in
+parallel instead of one leader serializing everything); failure blast
+radius shrinks (one group's election stalls 1/S of the keyspace); logs,
+snapshots and recovery parallelize. Costs: **cross-shard atomicity is
+gone** — two keys on different shards commit in two independent logs, so
+there is no single index that orders them; a multi-key transaction needs a
+coordination protocol *above* Raft (2PC with per-shard participant logs,
+or deterministic ordering à la Calvin). That is exactly why transactions
+are a stretch goal, not a checkbox: the primitive this milestone builds is
+per-shard linearizability, and pretending it composes for free across
+shards would be false.
+
+**Q14. How do S groups in one process avoid starving each other?**
+A. Three mechanisms. (1) Each group's event loop is its own goroutine, so
+a group busy applying can't block another's message processing — the
+scheduler preempts. (2) Time is delivered by one shared ticker as
+non-blocking channel enqueues (`Node.Tick` → buffered `msgc`); a slow
+group drops behind on its *own* clock rather than delaying anyone else's
+(worst case it misses ticks when its buffer is full, which only delays its
+own election timeout). (3) Persistence is per-group files, so one group's
+fsync doesn't hold another group's lock — they contend only on the shared
+disk, which is honest hardware contention, not a software serialization
+point.
