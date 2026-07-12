@@ -154,6 +154,89 @@ group's own message channel. What the shared ticker costs: tick delivery
 skew of at most the loop iteration time (microseconds for tens of groups),
 which is noise against 10–20-tick election timeouts.
 
+## The nemesis (M6 part 1): fault injection against real processes
+
+The verification harness (`internal/nemesis`, scenarios in
+`test/nemesis`) attacks a cluster of REAL `kvserver` processes over real
+TCP. Its parts:
+
+**Interposition: userspace TCP proxies, not iptables.** Every directed
+edge (i → j) of the cluster graph gets its own proxy; node i's `--peers`
+names j's proxy address, so every inter-node byte crosses the harness.
+Faults: cut an edge (connections severed, new ones refused), heal, inject
+per-chunk delay. Why proxies over iptables/WFP: no root, no OS-specific
+firewall state to leak on a crashed test, works identically on the
+Windows dev box and Linux CI, and per-directed-edge granularity falls out
+of the design instead of requiring source-port gymnastics. The honest
+limitation: this is **connection-level** asymmetry, not packet-level. A
+cut edge i → j stops i *initiating* to j, but responses on a connection j
+initiated to i still flow (they ride j's TCP stream). True one-way packet
+loss needs kernel help (iptables/tc/WFP) — documented, not faked. The
+asymmetric scenario is therefore precisely "a node that can be reached
+but cannot initiate", which is a real production failure (broken egress,
+half-open NAT).
+
+**Process faults.** kill -9 (`Process.Kill`) and suspend/resume — SIGSTOP
+/ SIGCONT on unix, `NtSuspendProcess`/`NtResumeProcess` (the debug API)
+on Windows: every thread freezes, sockets stay open, and the process
+keeps believing whatever it believed — the zombie-leader fault.
+
+**Seeding.** Every scenario derives its workload op sequence (and the
+soak its fault schedule) from one printed seed; `-args -seed=N` reruns
+those exact inputs. Honesty note: with real processes, a seed reproduces
+the *inputs* bit-for-bit (op sequences, fault types/order/durations), not
+the OS's interleaving — leader identity and message timing remain
+nondeterministic, as in any real-system harness.
+
+**Workload + history.** Concurrent session clients (exactly-once writes
+via client_id/serial) storm the cluster and record every operation with
+[invoke, return] wall-clock windows into a JSONL history
+(`internal/nemesis/history.go`) — the format the Porcupine checker
+consumes in M6 part 2. A write whose retries all timed out is recorded
+`unknown: true`: it may still commit later, so the checker must treat it
+as possibly-applied. Retries of one session write fold into one logical
+op (dedup makes them a single application).
+
+**RUN-2 verification (pre-Porcupine).** Clients own disjoint key ranges,
+so the legal final value of every key is exactly computable: the last
+acknowledged write, or any *later-serial* write whose ack the nemesis ate
+(session dedup's high-water mark means an *earlier* unknown write can
+never override a later ack — see `Workload.keyState`). Zero acknowledged
+loss, stated precisely. Shared-key linearizability is Porcupine's job.
+
+## The proof (M6 part 2): Porcupine over recorded histories
+
+Every nemesis scenario's history now runs through a linearizability
+checker (`internal/nemesis/checker.go`, using Porcupine) before the
+scenario may pass. The model: each key is an independent register —
+linearizability composes over independent objects, so the history
+partitions by key and the search stays tractable. Acked ops must
+linearize inside their [invoke, return] window; **unknown** (timed-out)
+puts keep an infinite window — if one never actually executed, the
+checker can always place it after every observation, so phantoms cannot
+false-alarm; unobserved gets/deletes constrain nothing and are dropped.
+Timestamp ties resolve return-before-invoke (WS-2 — the sound direction,
+because Return stamps postdate completion and Invoke stamps predate
+submission).
+
+Honest bounds of the model: session dedup gives the system a property
+the register model doesn't encode (an unknown older-serial write can
+never apply over a newer acked one), so the checker is marginally more
+permissive than the system — sound, no false alarms, slightly less
+strict. Encoding serials into the model is documented future work.
+
+**The checker is itself verified twice over.** Synthetic histories pin
+the model (stale reads and lost acked writes rejected; legal concurrency
+and phantom unknowns accepted). And the **mutation check**
+(`TestMutationCheckerCatchesDisabledReadBarrier`) proves the whole
+pipeline end-to-end against real processes: a build with the read
+barrier deliberately disabled (`RAFTKV_UNSAFE_NO_READ_BARRIER=1`, a
+screaming test-only hook) must produce a history the checker rejects.
+A green run of the harness is only meaningful because this red run is
+demonstrably red. The soak additionally proves the nemesis bites: node
+logs must show faults forcing re-elections during the storm, or the soak
+fails regardless of the checker's verdict.
+
 ## The five safety properties, mapped to code (M2–M3)
 
 Raft's correctness rests on five properties (paper §5.2–§5.4). Where each
@@ -235,6 +318,62 @@ it.
 election timer expired?" and "have I heard from a leader recently?") is a
 latent bug the moment those predicates need to diverge. Pre-vote is
 exactly that moment.
+
+### WS-2: the checker's first catch was itself (found 2026-07-12)
+
+**Symptom.** The mutation check — run a build with the read barrier
+deliberately disabled, watch the linearizability checker reject the
+resulting history — failed in the wrong direction: the deposed leader
+demonstrably served a stale read (`v1` after `v2` had committed on the
+majority, both recorded), and Porcupine **accepted** the history. A
+checker that blesses a provably broken build is worse than no checker: it
+manufactures false confidence at the exact moment the project claims
+"verified correctness."
+
+**Root cause.** Timestamp ties from a coarse clock. The recorder stamps
+ops with `time.Since(start)`; Windows' monotonic clock ticks at ~0.5ms,
+so the second put's *Return* and the stale get's *Invoke* landed on the
+identical nanosecond. Porcupine treats touching intervals as concurrent —
+correctly, given its input — and a "concurrent" stale read may legally
+linearize before the put it failed to observe. The violation vanished
+into clock granularity. The same history with distinct timestamps was
+already rejected by the model's unit test (`TestCheckerFlagsStaleRead`) —
+synthetic tests can't catch what only a real clock does.
+
+**First fix — itself a bug (act two).** The initial repair exploited
+which side of each stamp reality sits on (Return stamps postdate
+completion, Invoke stamps predate submission, so a tie must order
+return-before-invoke) via the interval transform `Call' = 2t+1,
+Return' = 2t`. It passed the mutation check — and then the very next
+full-suite run flagged `NemesisPartitionLeader` as NOT LINEARIZABLE. The
+node logs showed a textbook clean failover, which smelled like a false
+alarm, and triage confirmed it: an op that invokes and returns within a
+single 0.5ms clock tick (loopback RPCs routinely do) got `Call' = 2t+1 >
+Return' = 2t` — an **inverted interval**, undefined input that let
+Porcupine manufacture a violation. A checker that can cry wolf is as
+useless as one that's blind.
+
+**Final fix.** Kill ties at the source: `Recorder.Now()` is strictly
+monotonic (atomic compare-and-swap bump). Soundness: the CAS serializes
+the stamping events in their true order; since every Return stamp is an
+upper bound of a completion and every Invoke stamp a lower bound of a
+submission, stamp order implies a valid real-time order — no false
+constraints, no ties, and every op keeps `Call < Return`. The checker
+consumes raw stamps again; the triage rig (history persisted before the
+verdict, violating key's ops dumped on failure) stays, because the next
+alarm must arrive with its own evidence.
+
+**Regression tests.** `TestMutationCheckerCatchesDisabledReadBarrier`
+(caught act one), `TestNemesisPartitionLeader` under the checker gate
+(caught act two), and the synthetic checker suite — all green after the
+final fix.
+
+**Lesson.** Verify the verifier — then verify the fix to the verifier.
+Both bugs lived in the seam between correct components: a correct model
+fed degraded timestamps, then a correct model fed malformed intervals.
+Seams are where verification tooling rots, and the mutation check plus
+the false-alarm triage discipline are the two clamps holding this one
+shut.
 
 ## Known limitations (through Milestone 1)
 

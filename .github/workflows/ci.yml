@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch: # manual soak trigger
+  schedule:
+    - cron: "0 3 * * *" # nightly soak
 
 jobs:
   check:
@@ -30,6 +33,26 @@ jobs:
         run: go build ./...
 
       # -race subsumes a plain `go test`; every test runs under the
-      # race detector on every push.
+      # race detector on every push. This includes the fast nemesis
+      # scenarios (real processes, fault injection); the long random
+      # soak is gated behind NEMESIS_SOAK and runs in the job below.
       - name: test (race detector)
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout 15m ./...
+
+  # The random soak: minutes of seeded faults against real processes.
+  # Nightly and on manual dispatch only — too slow for every push.
+  soak:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: random soak (seeded; seed printed in the log for reruns)
+        env:
+          NEMESIS_SOAK: "1"
+          NEMESIS_SOAK_SECONDS: "180"
+        run: go test ./test/nemesis/ -run TestNemesisRandomSoak -v -count=1 -timeout 20m

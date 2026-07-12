@@ -45,7 +45,18 @@ type KVService struct {
 	node  *raft.Node
 	sm    *stateMachine
 	shard uint64 // this service's Raft group; 0 in unsharded mode
+
+	// unsafeNoReadBarrier serves Gets straight from the local state
+	// machine with NO leadership confirmation — the textbook stale-read
+	// bug. It exists so the verification harness can prove the
+	// linearizability checker catches a broken build (the mutation
+	// check); it must never be set outside that test. See DESIGN.md.
+	unsafeNoReadBarrier bool
 }
+
+// SetUnsafeNoReadBarrier enables the deliberately broken read path for
+// the checker's mutation test. Never call this in production wiring.
+func (s *Server) SetUnsafeNoReadBarrier(v bool) { s.KV.unsafeNoReadBarrier = v }
 
 // errEmptyKey is shared by the sharded router and the per-shard service —
 // key validation must happen before hashing an empty key to a shard.
@@ -91,8 +102,10 @@ func (s *KVService) Get(ctx context.Context, req *kvv1.GetRequest) (*kvv1.GetRes
 	}
 	// ReadIndex: block until this node has confirmed leadership and applied
 	// through the read index, so the read is linearizable.
-	if err := s.node.ReadBarrier(ctx); err != nil {
-		return nil, toStatus(s.node, s.shard, err)
+	if !s.unsafeNoReadBarrier {
+		if err := s.node.ReadBarrier(ctx); err != nil {
+			return nil, toStatus(s.node, s.shard, err)
+		}
 	}
 	value, found := s.sm.get(req.GetKey())
 	return &kvv1.GetResponse{Value: value, Found: found}, nil

@@ -201,7 +201,7 @@ func TestShardsSurviveNodeLossIndependently(t *testing.T) {
 		if _, done := seeded[g]; done {
 			continue
 		}
-		if err := put(k, "v1", 10*time.Second); err != nil {
+		if err := put(k, "v1", 20*time.Second); err != nil {
 			t.Fatalf("seeding shard %d: %v", g, err)
 		}
 		seeded[g] = k

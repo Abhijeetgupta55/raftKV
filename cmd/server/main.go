@@ -44,6 +44,7 @@ func main() {
 	dataDir := flag.String("data-dir", "data", "directory for the log and snapshots")
 	snapThreshold := flag.Int64("snapshot-threshold-bytes", 0, "standalone only: WAL size that triggers a snapshot (0 = default)")
 	shards := flag.Int("shards", 1, "cluster only: number of Raft groups the keyspace partitions across (fixed at first boot)")
+	compactAt := flag.Uint64("compaction-threshold", 0, "cluster only: applied entries between snapshots (0 = default 4096; tests use tiny values)")
 	flag.Parse()
 
 	var err error
@@ -53,7 +54,7 @@ func main() {
 		var members map[uint64]string
 		members, err = parseMembers(*peers, *id, *listenAddr)
 		if err == nil {
-			err = runCluster(*id, *listenAddr, *dataDir, members, *shards)
+			err = runCluster(*id, *listenAddr, *dataDir, members, *shards, *compactAt)
 		}
 	}
 	if err != nil {
@@ -114,7 +115,7 @@ func parseMembers(spec string, selfID uint64, selfAddr string) (map[uint64]strin
 
 // runCluster hosts one replica of every shard (Raft group) in this
 // process. shards=1 is the unsharded cluster — same runtime, one group.
-func runCluster(id uint64, listenAddr, dataDir string, members map[uint64]string, shards int) error {
+func runCluster(id uint64, listenAddr, dataDir string, members map[uint64]string, shards int, compactAt uint64) error {
 	transport := raft.NewGRPCTransport(members)
 	defer transport.Close()
 
@@ -127,13 +128,22 @@ func runCluster(id uint64, listenAddr, dataDir string, members map[uint64]string
 			HeartbeatTicks:   3,
 			Logger:           slog.Default(),
 		},
-		Transport:  transport,
-		RPCTimeout: time.Second,
+		Transport:           transport,
+		RPCTimeout:          time.Second,
+		CompactionThreshold: compactAt,
 	}, shards, dataDir, 30*time.Millisecond)
 	if err != nil {
 		return fmt.Errorf("start raft groups: %w", err)
 	}
 	defer srv.Stop()
+
+	// Mutation-check hook: deliberately breaks read linearizability so the
+	// verification harness can prove its checker catches a broken build.
+	// NEVER set this outside test/nemesis.
+	if os.Getenv("RAFTKV_UNSAFE_NO_READ_BARRIER") == "1" {
+		slog.Error("UNSAFE MODE: read barrier disabled — reads are NOT linearizable (mutation-check hook)")
+		srv.SetUnsafeNoReadBarrier(true)
+	}
 
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {

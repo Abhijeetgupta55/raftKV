@@ -24,7 +24,7 @@ and is the authoritative race gate.
 | M3 Production Raft | ✅ **implemented + proven** | Compaction/InstallSnapshot, single-server membership, pre-vote, leadership transfer — each has a passing integration test. |
 | M4 Linearizable reads + sessions | ✅ **done + proven** | ReadIndex proven linearizable. **Client-session dedup now implemented** — session table inside the replicated state machine, snapshot-included, with the double-apply-demonstrated-then-fixed test pair. (Read-path session caching and the naive-stale-read demo test remain as noted below.) |
 | M5 Sharding | ✅ **done + proven** | Multi-Raft: hash partitioning (FNV-1a % N), shared ticker, per-shard dirs, shard-count pin, shard-aware leader hints with per-shard CLI cache. Proven by a real-process kill-9 test — node hosting replicas of all 4 shards dies under a cross-shard storm, zero acked loss anywhere. |
-| M6 Verification | 🟠 foundation only | In-memory network supports seeded **partition** injection (one nemesis primitive). No crash/SIGSTOP nemesis, no Porcupine checker, nothing in CI. **RUN 2–3 territory; not started.** |
+| M6 Verification | ✅ **done + proven** | Nemesis (RUN 2) + the proof (RUN 3): every scenario's history must pass a Porcupine register-per-key model (unknown-op windows, tie discipline per WS-2); shared-key contention scenario; **mutation check proves the checker catches a broken build** (read barrier disabled → history rejected); soak requires log-proven elections (nemesis bites). WS-2 war story (two acts): the mutation check's first catch was the checker itself (timestamp ties), and the tie fix's own bug (inverted sub-tick windows → false alarms) was caught and fixed via a monotonic recorder clock. |
 | M7 Observability | 🟠 proto only | `proto/admin` generated. No metrics/logging/`kvadmin`/bench. **RUN 4; not started.** |
 
 > **Session-3 boundary (2026-07-07, later).** This run took the ladder from
@@ -294,4 +294,195 @@ go test ./test/cluster/ -run TestShardedClusterFailoverNoAckedLoss -v -count=1 -
 # By-hand multi-shard cluster (3 terminals; note --shards on every node):
 # bin/kvserver --id 1 --listen 127.0.0.1:5501 --peers 1@127.0.0.1:5501,2@127.0.0.1:5502,3@127.0.0.1:5503 --data-dir d/1 --shards 4
 # (idem id 2/3) ... then: bin/kvcli -addr 127.0.0.1:5501,127.0.0.1:5502,127.0.0.1:5503 put somekey v
+```
+
+---
+
+## RUN-2 addendum (2026-07-10) — M6 part 1: the nemesis
+
+### Shipped and proven
+
+1. **Interposition layer** (`internal/nemesis/proxy.go`): one userspace
+   TCP proxy per directed edge; every inter-node byte crosses the
+   harness (per-node `--peers` maps name proxy addresses). Faults:
+   partition (arbitrary group splits), heal, per-edge blackhole
+   (connection-level asymmetry — see DESIGN.md for the honest limits),
+   per-chunk delay. Cutting an edge severs live connections immediately.
+   Proxy-over-iptables rationale in DESIGN.md (no root, portable, CI-safe).
+2. **Process faults** (`proc.go` + platform files): kill -9;
+   suspend/resume via SIGSTOP/SIGCONT on unix and
+   NtSuspendProcess/NtResumeProcess (debug API) on Windows — the plan's
+   sanctioned Windows route, verified working locally (zombie scenario).
+   Linux CI path cross-compiled green.
+3. **Seeded workload + history** (`workload.go`, `history.go`):
+   concurrent session clients; retries folded into single logical ops;
+   timeouts recorded `unknown` (possibly-applied); JSONL histories with
+   [invoke, return] windows — the Porcupine input format. Per-client key
+   ownership makes RUN-2 verification exact: final value ∈ {last ack} ∪
+   {later-serial unknown writes}. Zero acked loss, precisely stated.
+4. **Six named scenarios** (`test/nemesis/nemesis_test.go`), all passing
+   against real processes, each printing its seed and rerunnable with
+   `-args -seed=N`:
+   - `TestNemesisLeaderKill` — kill -9 leader mid-storm, rejoin.
+   - `TestNemesisPartitionLeader` — leader isolated, majority continues,
+     heal, step-down + catch-up.
+   - `TestNemesisPartitionDuringSnapshot` — follower isolated while the
+     storm compacts the leader's log past it (threshold 64); heal forces
+     InstallSnapshot catch-up.
+   - `TestNemesisZombieLeader` — leader frozen, survivors commit v2,
+     zombie thaws believing it leads; 20 immediate direct reads must
+     never return v1. **ReadIndex proven against a real frozen process.**
+   - `TestNemesisAsymmetricPartition` — leader loses all outbound edges
+     (reachable, can't initiate); followers elect through the intact
+     reverse edges.
+   - `TestNemesisRandomSoak` — seeded random kills/partitions/suspends/
+     delays (45s default, `NEMESIS_SOAK_SECONDS` tunable), heal,
+     converge, verify. Local 30s run: 12 faults, 8,580 ops, zero loss.
+5. **CI wiring** (`.github/workflows/ci.yml`): the five fast scenarios
+   run on every push inside `go test -race ./...`; the soak runs nightly
+   (cron) and on manual dispatch with `NEMESIS_SOAK=1`, 180s storm.
+
+### Honest notes / deferred
+
+- **No linearizability checking yet** — histories are recorded and
+  round-trip, but nothing consumes them until Porcupine (RUN 3). RUN-2
+  verification is exact but per-client-key (no shared-key contention).
+- **"Prove the nemesis bites" instrumentation** (show elections/snapshots
+  happening during the soak, mutation check) is RUN-3 scope per the plan.
+  RUN 2's bite evidence: scenario logs show kills/partitions/suspends,
+  and a scenario with zero acked ops fails loudly.
+- **Asymmetry is connection-level**, not packet-level (userspace proxy).
+  DESIGN.md documents exactly what that can and cannot express.
+- **Seed reproduces inputs** (op sequences, fault schedule), not OS
+  interleaving — stated in DESIGN.md; deterministic-execution testing
+  lives in `internal/raft`.
+- No new war story: no consensus/wiring bug surfaced this run. Two
+  harness robustness issues were found and fixed (in the harness, not the
+  system): (1) a compaction threshold so low the leader probe starved
+  mid-storm — probe moved to before the storm; (2) under full-suite load
+  (four real-process suites in parallel on one machine) elections stretch
+  past tight per-write budgets — captured evidence showed a shard
+  correctly answering "not leader, election in flight" when a 5s write
+  budget expired; budgets raised to 15s with assertions untouched. The
+  harness now writes per-node process logs and dumps log tails + per-node
+  probe errors on any failure, so future flakes carry their own
+  post-mortem. Full suite verified green twice consecutively on main
+  after the fixes.
+
+### Fresh commit plan (RUN-2 changes)
+
+1. `feat(nemesis): TCP interposition proxies — per-edge partition, heal,
+   delay, blackhole` — `internal/nemesis/proxy.go`.
+2. `feat(nemesis): process faults — kill -9, suspend/resume (SIGSTOP /
+   NtSuspendProcess)` — `proc.go`, `proc_unix.go`, `proc_windows.go`.
+3. `feat(nemesis): seeded workload + Porcupine-ready JSONL history` —
+   `history.go`, `workload.go`.
+4. `feat(server): --compaction-threshold flag` — `cmd/server/main.go`.
+5. `test(nemesis): six named fault scenarios against real processes` —
+   `test/nemesis/nemesis_test.go`.
+6. `ci: nightly/manual random soak job` — `.github/workflows/ci.yml`.
+7. `docs: nemesis design, STATUS, REVIEW-GUIDE §9`.
+
+### Run commands (RUN-2 verification)
+
+```sh
+# The five fast scenarios (also run on every push in CI, under -race):
+go test ./test/nemesis/ -run 'TestNemesis' -v -count=1 -timeout 300s
+
+# One scenario, reproduced with its printed seed:
+go test ./test/nemesis/ -run TestNemesisZombieLeader -v -count=1 -args -seed=12345
+
+# The random soak (30s storm), histories kept for inspection:
+NEMESIS_SOAK=1 NEMESIS_SOAK_SECONDS=30 NEMESIS_HISTORY_DIR=/tmp/hist \
+  go test ./test/nemesis/ -run TestNemesisRandomSoak -v -count=1 -timeout 300s
+```
+
+---
+
+## RUN-3 addendum (2026-07-12) — M6 part 2: the proof
+
+### Shipped and proven
+
+1. **Porcupine checker** (`internal/nemesis/checker.go`, dep
+   `github.com/anishathalye/porcupine v1.3.0`): register-per-key model
+   (history partitions by key), acked ops in their [invoke, return]
+   window, unknown puts with infinite windows (phantom placement can't
+   false-alarm), unobserved gets/deletes dropped, ties resolved
+   return-before-invoke. Model honesty note: session-serial semantics are
+   not encoded (checker marginally more permissive than the system —
+   sound; future work).
+2. **Checker verified before use**: five synthetic-history unit tests
+   (stale read rejected, lost acked write rejected, legal concurrency and
+   phantoms accepted) — because a model bug and a consensus bug look
+   identical from outside.
+3. **Every scenario now gated on linearizability**: `runScenario` fails
+   any history Porcupine rejects, on top of the zero-acked-loss check.
+   All named scenarios green with the gate on; soak green over 9,569 ops.
+4. **Shared-key contention scenario** (`TestNemesisSharedKeyContention`):
+   all clients hammer one key range plus deletes across a leader
+   partition; the checker is the sole verifier (no per-client oracle
+   exists for multi-writer keys) — 2,534-op history linearizable.
+5. **Mutation check** (`TestMutationCheckerCatchesDisabledReadBarrier`):
+   cluster boots with `RAFTKV_UNSAFE_NO_READ_BARRIER=1` (a screaming
+   test-only hook in `kvraft`), a partitioned deposed leader serves a
+   provably stale read, and the checker MUST reject the history. It does.
+   **This test found WS-2 on its first run** — the checker itself was
+   blind to the violation because coarse Windows clock stamps produced
+   timestamp ties Porcupine treats as concurrency. The first fix (an
+   interval transform) was itself buggy — sub-tick ops got inverted
+   windows, manufacturing FALSE violations (caught when a clean
+   PartitionLeader failover was flagged Illegal; node logs acquitted the
+   system). Final fix: a strictly monotonic recorder clock. Both acts in
+   the WS-2 war story, DESIGN.md.
+6. **Nemesis-bites evidence**: the soak now counts "won election" lines
+   in per-node logs and FAILS if faults didn't force re-elections
+   (last run: 8 elections; boot accounts for 1).
+
+### Honest notes / deferred
+
+- **Seeds**: named scenarios were run across multiple distinct seeds
+  locally (each run prints its seed; all green); the nightly CI soak
+  accumulates more seeds over time. "Repeatedly across seeds" is an
+  ongoing accumulation, not a one-session box to tick.
+- **The earlier "unreproduced intermittent" is now explained.** The one
+  `TestNemesisPartitionDuringSnapshot` failure (38s, first soak-enabled
+  run) occurred while the buggy interval transform was active and matches
+  the WS-2 act-two false-alarm signature exactly (a Porcupine Illegal
+  after a clean-looking scenario). With the monotonic-clock fix, the full
+  nemesis package including the soak passes; scenario failures now
+  persist their history file *before* the verdict and dump the violating
+  key's ops, so any future alarm arrives with its own evidence.
+- **The naive-stale-read pedagogy pair** the roadmap wanted for M4 now
+  exists in spirit as the mutation check (naive read demonstrated broken,
+  barrier proves it fixed); noted as satisfied by RUN 3.
+- The `unsafeNoReadBarrier` hook lives in production code, gated by an
+  env var that logs an ERROR at boot. Trade-off accepted: a permanent,
+  CI-runnable mutation check beats a throwaway branch that rots.
+
+### Fresh commit plan (RUN-3 changes)
+
+1. `deps: add porcupine v1.3.0` — go.mod/go.sum.
+2. `feat(nemesis): Porcupine linearizability checker with unknown-op and
+   tie semantics` — `checker.go` + `checker_test.go` (reference WS-2).
+3. `feat(kvraft): RAFTKV_UNSAFE_NO_READ_BARRIER mutation-check hook` —
+   `service.go`, `sharding.go`, `cmd/server/main.go`.
+4. `feat(nemesis): shared-key workload mode + deletes` — `workload.go`.
+5. `test(nemesis): checker gate on every scenario; shared-key contention;
+   mutation check; soak bite evidence` — `nemesis_test.go`, `proc.go`.
+6. `docs: WS-2 war story, checker design, STATUS, REVIEW-GUIDE §10`.
+
+### Run commands (RUN-3 verification)
+
+```sh
+# The checker's own unit suite:
+go test ./internal/nemesis/ -run TestChecker -v -count=1
+
+# The mutation check — watch the checker reject a broken build:
+go test ./test/nemesis/ -run TestMutationChecker -v -count=1 -timeout 120s
+
+# Shared-key contention under partition, Porcupine-verified:
+go test ./test/nemesis/ -run TestNemesisSharedKeyContention -v -count=1 -timeout 180s
+
+# Everything incl. a 45s soak with bite evidence:
+NEMESIS_SOAK=1 NEMESIS_SOAK_SECONDS=45 go test ./test/nemesis/ -v -count=1 -timeout 600s
 ```

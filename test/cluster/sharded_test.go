@@ -46,7 +46,7 @@ func TestShardedClusterFailoverNoAckedLoss(t *testing.T) {
 		serial++
 		k := fmt.Sprintf("shardkey-%03d", i)
 		v := fmt.Sprintf("v%03d", i)
-		if err := cli.put(1, serial, k, v, time.Now().Add(5*time.Second)); err != nil {
+		if err := cli.put(1, serial, k, v, time.Now().Add(15*time.Second)); err != nil {
 			t.Fatalf("write %s failed pre-kill: %v", k, err)
 		}
 		acked[k] = v

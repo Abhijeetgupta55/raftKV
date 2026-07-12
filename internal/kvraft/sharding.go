@@ -114,6 +114,14 @@ func (s *ShardedServer) Nodes() map[uint64]*raft.Node {
 	return m
 }
 
+// SetUnsafeNoReadBarrier propagates the mutation-check hook (see
+// service.go) to every shard. Test harness use only.
+func (s *ShardedServer) SetUnsafeNoReadBarrier(v bool) {
+	for _, sh := range s.shards {
+		sh.SetUnsafeNoReadBarrier(v)
+	}
+}
+
 func (s *ShardedServer) Stop() {
 	s.once.Do(func() { close(s.stopc) })
 	s.wg.Wait()

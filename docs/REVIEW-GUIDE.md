@@ -333,3 +333,144 @@ own election timeout). (3) Persistence is per-group files, so one group's
 fsync doesn't hold another group's lock — they contend only on the shared
 disk, which is honest hardware contention, not a software serialization
 point.
+
+---
+
+## §9. The nemesis — fault injection (RUN 2)
+
+Read in order:
+1. DESIGN.md "The nemesis (M6 part 1)" — proxy-over-iptables rationale,
+   connection-level asymmetry honesty, seeding semantics.
+2. `internal/nemesis/proxy.go` — directed-edge `Proxy`, full-mesh `Net`
+   (Partition/Heal/Blackhole/DelayAll).
+3. `internal/nemesis/proc.go` (+ `proc_windows.go`/`proc_unix.go`) —
+   kill -9 and suspend/resume.
+4. `internal/nemesis/history.go` — the Op record and its timeout
+   semantics (`unknown`), JSONL round-trip.
+5. `internal/nemesis/workload.go` — session clients, folded retries,
+   `keyState` legal-final-value tracking.
+6. `test/nemesis/nemesis_test.go` — harness wiring (per-node peer maps
+   through proxies) and the six named scenarios.
+
+Invariants and where enforced:
+- **Every inter-node byte crosses the harness.** Each node's `--peers`
+  names proxy addresses, never real ones (`startCluster`).
+- **A cut edge fails NOW.** `setDropped` closes live connections rather
+  than letting in-flight RPCs ride out a timeout.
+- **Unknown ≠ failed.** A timed-out write is recorded `unknown: true` and
+  its value stays in the key's legal-final set (`noteUnknown`) — the
+  harness never accuses the cluster of losing a write it never acked, and
+  never forgives losing one it did.
+- **The nemesis must bite.** A scenario whose history contains zero acked
+  ops fails loudly (`scenario()`): a workload the faults fully starved
+  tested nothing.
+
+### Checkpoint questions (RUN-2 gate)
+
+**Q15. Why does the zombie-leader scenario prove ReadIndex, and what
+would a naive-read implementation have done?**
+A. The suspended ex-leader thaws with open sockets, leader role, and a
+state machine frozen at v1 while the cluster committed v2. A naive
+implementation answers Gets straight from its local state machine — v1, a
+linearizability violation invisible to any log-based check. With
+ReadIndex the zombie must collect a majority of fresh heartbeat acks at
+its own term before serving; the survivors are at a higher term, so the
+barrier fails (and steps it down). The test hammers the zombie with
+direct reads the instant it thaws and fails the run if v1 ever escapes.
+
+**Q16. Your asymmetric partition is connection-level, not packet-level.
+What can't it express, and why is that acceptable?**
+A. It cannot express "A's packets to B vanish while B's packets to A on
+the SAME connection arrive" — TCP responses ride the requester's stream
+through the requester's egress proxy. So one-way *packet* loss (a
+mis-negotiated NIC, asymmetric routing) is out of reach without kernel
+interposition. What it does express — a node reachable by others but
+unable to initiate (broken egress, half-open NAT, exhausted conntrack) —
+is a real and nasty class: the leader keeps receiving client traffic
+while its heartbeats die. Documented as a limitation instead of faking
+packet semantics in userspace.
+
+**Q17. A write times out, the client moves on, and the value appears in
+the store an hour later. Is the harness wrong to accept that?**
+A. No — that is precisely correct behavior. The client's ack never
+arrived, so the write's outcome is UNKNOWN: the command may have committed
+after the client gave up (Raft doesn't un-commit on client timeout). The
+harness records it `unknown: true` and includes its value in the key's
+legal final set — but only for serials NEWER than the last ack, because
+session dedup's high-water mark guarantees an older unknown write can
+never overwrite a newer acknowledged one. Rejecting such a state would be
+a false alarm; silently allowing arbitrary values would be blindness.
+
+**Q18. What exactly does the seed reproduce?**
+A. The inputs: each client's op sequence (keys, values, op mix) and the
+soak's fault schedule (types, targets, durations) are pure functions of
+the seed. It does NOT reproduce OS scheduling, election outcomes, or
+message interleavings — no real-process harness can. Reproducibility here
+means "same experiment", not "same execution"; determinism of execution
+lives in the in-process tests (`internal/raft`), which is why both layers
+exist.
+
+---
+
+## §10. The proof — Porcupine + mutation check (RUN 3)
+
+Read in order:
+1. DESIGN.md "The proof (M6 part 2)" and **war story WS-2**.
+2. `internal/nemesis/checker.go` — the register-per-key model, unknown-op
+   semantics, and the timestamp-tie transform.
+3. `internal/nemesis/checker_test.go` — the synthetic histories pinning
+   the model.
+4. `test/nemesis/nemesis_test.go` — `runScenario`'s checker gate,
+   `scenarioShared`, `TestMutationCheckerCatchesDisabledReadBarrier`, and
+   the soak's election-count bite evidence.
+5. `internal/kvraft/service.go` — the `unsafeNoReadBarrier` hook (and why
+   it exists).
+
+Invariants and where enforced:
+- **No scenario passes on zero-loss alone**: `runScenario` fails unless
+  the full history linearizes (`CheckLinearizability` gate).
+- **Phantoms can't false-alarm; staleness can't hide**: unknown puts get
+  infinite windows; ties order return-before-invoke. → checker unit suite.
+- **The checker is proven able to fail**: the mutation build must be
+  rejected. → `TestMutationCheckerCatchesDisabledReadBarrier`.
+- **The nemesis is proven to bite**: soak requires >1 election in node
+  logs. → `TestNemesisRandomSoak`.
+
+### Checkpoint questions (RUN-3 gate)
+
+**Q19. Why is placing a never-executed "unknown" write at the end of the
+history always safe for the checker, and when would it be WRONG?**
+A. Porcupine must linearize every op it's given. A phantom placed after
+the last observation changes no read's expected value, so if the write
+truly never executed, that placement always exists and no false alarm
+fires. It would be wrong if the system could apply the write *and* the
+checker also needed to prove it applied — but an unknown op's contract is
+"at most once, any time after invoke," which the infinite window encodes
+exactly. What WOULD be unsound is dropping unknown *puts* (a read
+observing the phantom's value would then be flagged) — only unobserved
+reads/deletes may be dropped.
+
+**Q20. Walk me through WS-2. What class of bug is it, and why didn't the
+unit tests catch it?**
+A. Timestamp ties from a coarse Windows clock made a provably-stale read
+look concurrent with the write it missed; Porcupine (correctly, per its
+inputs) accepted the history, so the checker was blind. The class:
+correct components composed across a seam carrying degraded data — model
+logic was right, clock was right, but interval semantics at the boundary
+lost the real-time order. Unit tests used hand-written distinct
+timestamps, so the seam never carried a tie. The real-process mutation
+check exists precisely for this: it exercises the pipeline with real
+clocks, real RPCs, real staleness. Fix: ties order return-before-invoke
+(sound because Return stamps postdate completion and Invoke stamps
+predate submission), via the 2t/2t+1 interval transform.
+
+**Q21. The soak passed the checker across seeds. Why is that claim only
+as strong as the mutation check and the bite evidence?**
+A. "Checker found nothing" has three explanations: the system is correct,
+the checker is blind, or the faults never stressed anything. The mutation
+check eliminates the second (the checker demonstrably rejects a broken
+build on this exact pipeline); the election-count evidence eliminates the
+third (faults provably forced re-elections mid-storm). Only with both in
+hand does a green soak support the first explanation. This is the
+suspicion rule from the verification plan, implemented as failing tests
+rather than good intentions.

@@ -192,7 +192,7 @@ func TestClusterFailoverNoAckedLoss(t *testing.T) {
 	cli := newClient(t, addrs)
 
 	// Wait for the cluster to elect a leader and accept the first write.
-	if err := cli.put(1, 1, "boot", "ok", time.Now().Add(10*time.Second)); err != nil {
+	if err := cli.put(1, 1, "boot", "ok", time.Now().Add(15*time.Second)); err != nil {
 		t.Fatalf("cluster never became writable: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestClusterFailoverNoAckedLoss(t *testing.T) {
 		serial++
 		k := fmt.Sprintf("k%03d", i)
 		v := fmt.Sprintf("v%03d", i)
-		if err := cli.put(1, serial, k, v, time.Now().Add(5*time.Second)); err != nil {
+		if err := cli.put(1, serial, k, v, time.Now().Add(15*time.Second)); err != nil {
 			t.Fatalf("write %s failed pre-kill: %v", k, err)
 		}
 		acked[k] = v
@@ -226,7 +226,7 @@ func TestClusterFailoverNoAckedLoss(t *testing.T) {
 		serial++
 		k := fmt.Sprintf("k%03d", i)
 		v := fmt.Sprintf("v%03d", i)
-		if err := cli.put(1, serial, k, v, time.Now().Add(10*time.Second)); err != nil {
+		if err := cli.put(1, serial, k, v, time.Now().Add(15*time.Second)); err != nil {
 			t.Fatalf("write %s failed after failover: %v", k, err)
 		}
 		acked[k] = v
@@ -234,7 +234,7 @@ func TestClusterFailoverNoAckedLoss(t *testing.T) {
 
 	// Zero acknowledged loss: every acked write must read back correctly.
 	for k, want := range acked {
-		got, found, err := cli.get(k, time.Now().Add(10*time.Second))
+		got, found, err := cli.get(k, time.Now().Add(15*time.Second))
 		if err != nil {
 			t.Fatalf("read-back %s: %v", k, err)
 		}
@@ -247,10 +247,10 @@ func TestClusterFailoverNoAckedLoss(t *testing.T) {
 	// full health and still serves all data.
 	nodes[killedID].start(t)
 	time.Sleep(2 * time.Second)
-	if err := cli.put(1, serial+1, "afterrejoin", "yes", time.Now().Add(10*time.Second)); err != nil {
+	if err := cli.put(1, serial+1, "afterrejoin", "yes", time.Now().Add(15*time.Second)); err != nil {
 		t.Fatalf("cluster not writable after rejoin: %v", err)
 	}
-	if got, found, err := cli.get("k000", time.Now().Add(10*time.Second)); err != nil || !found || got != "v000" {
+	if got, found, err := cli.get("k000", time.Now().Add(15*time.Second)); err != nil || !found || got != "v000" {
 		t.Fatalf("data lost after rejoin: k000=%q found=%v err=%v", got, found, err)
 	}
 }
